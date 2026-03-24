@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 from datetime import datetime
+from typing import Optional
 
 try:
     import tkinter as tk
@@ -119,8 +120,7 @@ class PMXController:
         except Exception:
             return 0.0
 
-    def emergency_stop(self, stop_event: threading.Event | None = None):
-        # Safe stop: ramp down to 0 V, then output OFF
+    def emergency_stop(self, stop_event: Optional[threading.Event] = None):
         safe_ramp_to_zero(self, stop_event=stop_event)
         self.write("OUTP 0")
 
@@ -177,7 +177,7 @@ class PMXLogger:
 # =========================================================
 # Ramp utility
 # =========================================================
-def wait_with_stop(total_s: float, stop_event: threading.Event | None = None):
+def wait_with_stop(total_s: float, stop_event: Optional[threading.Event] = None):
     step = 0.01
     n = max(1, int(total_s / step))
     for _ in range(n):
@@ -192,7 +192,7 @@ def wait_with_stop(total_s: float, stop_event: threading.Event | None = None):
     return True
 
 
-def ramp_voltage(ctrl: PMXController, target_v: float, stop_event: threading.Event | None = None):
+def ramp_voltage(ctrl: PMXController, target_v: float, stop_event: Optional[threading.Event] = None):
     if target_v < 0:
         target_v = 0
     if target_v > MAX_VOLTAGE:
@@ -223,7 +223,7 @@ def ramp_voltage(ctrl: PMXController, target_v: float, stop_event: threading.Eve
             return
 
 
-def safe_ramp_to_zero(ctrl: PMXController, stop_event: threading.Event | None = None):
+def safe_ramp_to_zero(ctrl: PMXController, stop_event: Optional[threading.Event] = None):
     current_set = ctrl.get_set_voltage()
 
     if current_set <= 0:
@@ -329,11 +329,11 @@ class App:
         self.update_onoff_button_normal()
 
     def update_ui_state(self):
-        on = self.is_output_on()
         busy = (
             (self.ramp_thread is not None and self.ramp_thread.is_alive()) or
             (self.emergency_thread is not None and self.emergency_thread.is_alive())
         )
+        on = self.is_output_on()
 
         self.update_onoff_button_normal()
 
