@@ -22,8 +22,8 @@ PMX_PORT = 5025
 SOCKET_TIMEOUT = 3.0
 
 USE_GUI = True          # True: GUI, False: CUI
-ENABLE_LOG = False      # True: start logging automatically in CUI / GUI button available
-TARGET_VOLTAGE = 10.0   # desired voltage [V]
+ENABLE_LOG = False      # CUI auto logging
+TARGET_VOLTAGE = 10.0   # default target voltage [V]
 
 MAX_VOLTAGE = 62.0      # [V]
 MAX_CURRENT = 0.010     # [A] = 10 mA
@@ -34,8 +34,7 @@ RAMP_INTERVAL_S = 0.1   # [s]
 LOG_INTERVAL_S = 10.0   # [s]
 POLL_INTERVAL_MS = 1000 # GUI measurement refresh
 
-# 拡張子は指定どおり .cvs
-LOG_EXTENSION = ".cvs"
+LOG_EXTENSION = ".csv"
 
 
 # =========================================================
@@ -82,7 +81,6 @@ class PMXController:
             return data.decode("ascii", errors="replace").strip()
 
     def initialize(self):
-        # 外部制御無効、電流制限設定、保護解除、初期電圧0V
         self.write("VOLT:EXT:SOUR NONE")
         self.write("CURR:EXT:SOUR NONE")
         self.write(f"CURR {MAX_CURRENT:.6f}")
@@ -90,7 +88,6 @@ class PMXController:
         self.write("VOLT 0.000000")
 
     def output_on(self):
-        # ON時は必ず0V固定
         self.write("VOLT 0.000000")
         self.write(f"CURR {MAX_CURRENT:.6f}")
         self.write("OUTP:PROT:CLE")
@@ -122,6 +119,11 @@ class PMXController:
         except Exception:
             return 0.0
 
+    def emergency_stop(self, stop_event: threading.Event | None = None):
+        # Safe stop: ramp down to 0 V, then output OFF
+        safe_ramp_to_zero(self, stop_event=stop_event)
+        self.write("OUTP 0")
+
 
 # =========================================================
 # Logger
@@ -134,7 +136,6 @@ class PMXLogger:
         self.filename = None
 
     def _make_filename(self):
-        # yyyy-mmdd-HHMMSS.cvs
         return datetime.now().strftime("%Y-%m%d-%H%M%S") + LOG_EXTENSION
 
     def start(self):
@@ -176,7 +177,22 @@ class PMXLogger:
 # =========================================================
 # Ramp utility
 # =========================================================
-def ramp_voltage(ctrl: PMXController, target_v: float, log_func=print):
+def wait_with_stop(total_s: float, stop_event: threading.Event | None = None):
+    step = 0.01
+    n = max(1, int(total_s / step))
+    for _ in range(n):
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(step)
+    remain = total_s - n * step
+    if remain > 0:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(remain)
+    return True
+
+
+def ramp_voltage(ctrl: PMXController, target_v: float, stop_event: threading.Event | None = None):
     if target_v < 0:
         target_v = 0
     if target_v > MAX_VOLTAGE:
@@ -184,7 +200,6 @@ def ramp_voltage(ctrl: PMXController, target_v: float, log_func=print):
 
     current_set = ctrl.get_set_voltage()
 
-    # 端数のある最終値まで安全に到達
     if abs(target_v - current_set) < 1e-9:
         return
 
@@ -192,17 +207,35 @@ def ramp_voltage(ctrl: PMXController, target_v: float, log_func=print):
     v = current_set
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+
         next_v = v + step
 
         if (step > 0 and next_v >= target_v) or (step < 0 and next_v <= target_v):
             ctrl.set_voltage(target_v)
-            log_func(f"Set voltage -> {target_v:.1f} V")
             break
         else:
             ctrl.set_voltage(next_v)
-            log_func(f"Set voltage -> {next_v:.1f} V")
             v = next_v
-            time.sleep(RAMP_INTERVAL_S)
+
+        if not wait_with_stop(RAMP_INTERVAL_S, stop_event):
+            return
+
+
+def safe_ramp_to_zero(ctrl: PMXController, stop_event: threading.Event | None = None):
+    current_set = ctrl.get_set_voltage()
+
+    if current_set <= 0:
+        ctrl.set_voltage(0.0)
+        return
+
+    v = current_set
+    while v > 0:
+        next_v = max(0.0, v - RAMP_STEP_V)
+        ctrl.set_voltage(next_v)
+        v = next_v
+        wait_with_stop(RAMP_INTERVAL_S, stop_event=None)
 
 
 # =========================================================
@@ -215,7 +248,10 @@ class App:
 
         self.ctrl = PMXController()
         self.logger = PMXLogger(self.ctrl)
+
         self.ramp_thread = None
+        self.ramp_stop_event = threading.Event()
+        self.emergency_thread = None
 
         try:
             self.ctrl.initialize()
@@ -234,26 +270,40 @@ class App:
     def build_widgets(self):
         pad = {"padx": 8, "pady": 6}
 
-        tk.Label(self.root, text="設定電圧 [V]").grid(row=0, column=0, sticky="e", **pad)
-        self.entry_target = tk.Entry(self.root, textvariable=self.target_var, width=12)
-        self.entry_target.grid(row=0, column=1, **pad)
+        tk.Label(self.root, text=f"IP: {PMX_IP}", font=("Arial", 11, "bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", **pad
+        )
 
-        self.btn_set = tk.Button(self.root, text="電圧セット", width=14, command=self.on_set_voltage)
-        self.btn_set.grid(row=0, column=2, **pad)
+        tk.Label(self.root, text="Voltage").grid(row=1, column=0, sticky="e", **pad)
+        tk.Label(self.root, textvariable=self.meas_v_var, width=12, anchor="w").grid(row=1, column=1, sticky="w", **pad)
+
+        tk.Label(self.root, text="Current").grid(row=1, column=2, sticky="e", **pad)
+        tk.Label(self.root, textvariable=self.meas_i_var, width=12, anchor="w").grid(row=1, column=3, sticky="w", **pad)
+
+        tk.Label(self.root, text="Target Voltage").grid(row=2, column=0, sticky="e", **pad)
+        self.entry_target = tk.Entry(self.root, textvariable=self.target_var, width=12)
+        self.entry_target.grid(row=2, column=1, sticky="w", **pad)
+
+        self.btn_set = tk.Button(self.root, text="Set Voltage", width=14, command=self.on_set_voltage)
+        self.btn_set.grid(row=2, column=2, columnspan=2, sticky="ew", **pad)
+
+        self.btn_emergency = tk.Button(
+            self.root, text="Emergency Stop", width=14, bg="orange red", fg="white", command=self.on_emergency_stop
+        )
+        self.btn_emergency.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
+
+        self.btn_log = tk.Button(self.root, text="Start Log", width=14, command=self.on_toggle_log)
+        self.btn_log.grid(row=3, column=2, columnspan=2, sticky="ew", **pad)
 
         self.btn_onoff = tk.Button(self.root, text="OFF", width=14, bg="light gray", command=self.on_toggle_output)
-        self.btn_onoff.grid(row=1, column=0, columnspan=3, sticky="ew", **pad)
+        self.btn_onoff.grid(row=4, column=0, columnspan=4, sticky="ew", **pad)
 
-        self.btn_log = tk.Button(self.root, text="ログ開始", width=14, command=self.on_toggle_log)
-        self.btn_log.grid(row=2, column=0, columnspan=3, sticky="ew", **pad)
+        self.btn_onoff.bind("<Enter>", self.on_onoff_hover_enter)
+        self.btn_onoff.bind("<Leave>", self.on_onoff_hover_leave)
 
-        tk.Label(self.root, text="現在の電圧 [V]").grid(row=3, column=0, sticky="e", **pad)
-        tk.Label(self.root, textvariable=self.meas_v_var, width=16, anchor="w").grid(row=3, column=1, columnspan=2, sticky="w", **pad)
-
-        tk.Label(self.root, text="現在の電流 [A]").grid(row=4, column=0, sticky="e", **pad)
-        tk.Label(self.root, textvariable=self.meas_i_var, width=16, anchor="w").grid(row=4, column=1, columnspan=2, sticky="w", **pad)
-
-        tk.Label(self.root, textvariable=self.log_status_var).grid(row=5, column=0, columnspan=3, **pad)
+        tk.Label(self.root, textvariable=self.log_status_var).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad
+        )
 
     def is_output_on(self):
         try:
@@ -261,34 +311,55 @@ class App:
         except Exception:
             return False
 
+    def update_onoff_button_normal(self):
+        on = self.is_output_on()
+        if on:
+            self.btn_onoff.config(text="ON", bg="red", activebackground="red", fg="white")
+        else:
+            self.btn_onoff.config(text="OFF", bg="light gray", activebackground="light gray", fg="black")
+
+    def on_onoff_hover_enter(self, event=None):
+        on = self.is_output_on()
+        if on:
+            self.btn_onoff.config(text="OFF", bg="red", activebackground="red", fg="white")
+        else:
+            self.btn_onoff.config(text="ON", bg="light gray", activebackground="light gray", fg="black")
+
+    def on_onoff_hover_leave(self, event=None):
+        self.update_onoff_button_normal()
+
     def update_ui_state(self):
         on = self.is_output_on()
+        busy = (
+            (self.ramp_thread is not None and self.ramp_thread.is_alive()) or
+            (self.emergency_thread is not None and self.emergency_thread.is_alive())
+        )
 
-        if on:
-            self.btn_onoff.config(text="ON", bg="red")
+        self.update_onoff_button_normal()
+
+        if on and not busy:
             self.entry_target.config(state="normal")
             self.btn_set.config(state="normal")
         else:
-            self.btn_onoff.config(text="OFF", bg="light gray")
             self.entry_target.config(state="disabled")
             self.btn_set.config(state="disabled")
 
         if self.logger.running:
-            self.btn_log.config(text="ログ停止")
+            self.btn_log.config(text="Stop Log")
             if self.logger.filename:
                 self.log_status_var.set(f"LOG: ON ({self.logger.filename})")
             else:
                 self.log_status_var.set("LOG: ON")
         else:
-            self.btn_log.config(text="ログ開始")
+            self.btn_log.config(text="Start Log")
             self.log_status_var.set("LOG: OFF")
 
     def update_measurements(self):
         try:
             v = self.ctrl.measure_voltage()
             i = self.ctrl.measure_current()
-            self.meas_v_var.set(f"{v:.3f}")
-            self.meas_i_var.set(f"{i:.6f}")
+            self.meas_v_var.set(f"{v:.3f} V")
+            self.meas_i_var.set(f"{i:.6f} A")
         except Exception:
             self.meas_v_var.set("ERR")
             self.meas_i_var.set("ERR")
@@ -301,7 +372,6 @@ class App:
             if self.is_output_on():
                 self.ctrl.output_off()
             else:
-                # ON時は必ず0V
                 self.ctrl.output_on()
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -309,22 +379,27 @@ class App:
 
     def on_set_voltage(self):
         if self.ramp_thread is not None and self.ramp_thread.is_alive():
-            messagebox.showwarning("Busy", "電圧変更中です。")
+            messagebox.showwarning("Busy", "Voltage ramp is in progress.")
+            return
+        if self.emergency_thread is not None and self.emergency_thread.is_alive():
+            messagebox.showwarning("Busy", "Emergency stop is in progress.")
             return
 
         try:
             target = float(self.target_var.get())
         except ValueError:
-            messagebox.showerror("Error", "設定電圧が不正です。")
+            messagebox.showerror("Error", "Invalid target voltage.")
             return
 
         if target < 0 or target > MAX_VOLTAGE:
-            messagebox.showerror("Error", f"設定電圧は 0 ～ {MAX_VOLTAGE} V にしてください。")
+            messagebox.showerror("Error", f"Target voltage must be between 0 and {MAX_VOLTAGE} V.")
             return
+
+        self.ramp_stop_event.clear()
 
         def worker():
             try:
-                ramp_voltage(self.ctrl, target, log_func=lambda msg: None)
+                ramp_voltage(self.ctrl, target, stop_event=self.ramp_stop_event)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
 
@@ -341,6 +416,24 @@ class App:
             messagebox.showerror("Error", str(e))
         self.update_ui_state()
 
+    def on_emergency_stop(self):
+        if self.emergency_thread is not None and self.emergency_thread.is_alive():
+            return
+
+        self.ramp_stop_event.set()
+
+        def worker():
+            try:
+                if self.ramp_thread is not None and self.ramp_thread.is_alive():
+                    self.ramp_thread.join(timeout=1.0)
+                self.ctrl.emergency_stop()
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+        self.emergency_thread = threading.Thread(target=worker, daemon=True)
+        self.emergency_thread.start()
+        self.update_ui_state()
+
 
 # =========================================================
 # CUI
@@ -348,8 +441,9 @@ class App:
 def run_cui():
     ctrl = PMXController()
     logger = PMXLogger(ctrl)
+    ramp_stop_event = threading.Event()
 
-    print(f"Connecting to {PMX_IP}:{PMX_PORT}")
+    print(f"IP: {PMX_IP}")
     ctrl.initialize()
 
     if ENABLE_LOG:
@@ -358,8 +452,8 @@ def run_cui():
 
     try:
         ctrl.output_on()
-        print("Output ON (0 V fixed)")
-        ramp_voltage(ctrl, TARGET_VOLTAGE)
+        print("Output ON (fixed at 0 V)")
+        ramp_voltage(ctrl, TARGET_VOLTAGE, stop_event=ramp_stop_event)
         v = ctrl.measure_voltage()
         i = ctrl.measure_current()
         print(f"Measured: {v:.3f} V, {i:.6f} A")
@@ -367,7 +461,9 @@ def run_cui():
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        print("\nInterrupted. Safe ramp-down to 0 V, then output OFF.")
+        ramp_stop_event.set()
+        ctrl.emergency_stop()
     finally:
         logger.stop()
         ctrl.close()
@@ -382,7 +478,7 @@ def main():
             print("tkinter is not available. Set USE_GUI = False.")
             return
         root = tk.Tk()
-        app = App(root)
+        App(root)
         root.mainloop()
     else:
         run_cui()
